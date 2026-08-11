@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { createReadStream, createWriteStream, realpathSync } from "node:fs";
 import { access, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import http from "node:http";
@@ -28,7 +28,53 @@ const TEXT_EXTENSIONS = new Set([".txt", ".md", ".json", ".csv", ".log", ".js", 
 const SESSION_SECONDS = 12 * 60 * 60;
 const UPLOAD_CHUNK = 16 * 1024 * 1024;
 const UPLOAD_SESSIONS = path.join(os.tmpdir(), "mac-hub-upload-sessions");
+const API_KEYS_FILE = process.env.HUB_API_KEYS_FILE || path.join(USER_HOME, ".unifying-storage", "api-keys.json");
 const uploadSessions = new Map();
+
+async function keyStore(file = API_KEYS_FILE) {
+  try { return JSON.parse(await readFile(file, "utf8")); }
+  catch (error) {
+    if (error.code === "ENOENT") return { folders: [] };
+    throw error;
+  }
+}
+
+async function saveKeyStore(store, file = API_KEYS_FILE) {
+  await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  await writeFile(file, `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600 });
+}
+
+const keyHash = (key) => createHash("sha256").update(key).digest("hex");
+
+export async function issueFolderKey(relative, label = "API key", permission = "read", root = SHARED_ROOT, keysFile = API_KEYS_FILE) {
+  const target = safePath(root, relative);
+  if (!(await stat(target)).isDirectory()) throw new Error("API 키는 폴더에만 발급할 수 있습니다.");
+  if (!['read', 'write'].includes(permission)) throw new Error("권한은 read 또는 write여야 합니다.");
+  const store = await keyStore(keysFile);
+  let folder = store.folders.find((item) => item.path === path.relative(root, target));
+  if (!folder) {
+    folder = { id: randomUUID(), path: path.relative(root, target), keys: [] };
+    store.folders.push(folder);
+  }
+  const secret = `us_live_${randomBytes(32).toString("base64url")}`;
+  const key = { id: randomUUID(), label: String(label || "API key").slice(0, 80), permission, hash: keyHash(secret), createdAt: new Date().toISOString() };
+  folder.keys.push(key);
+  await saveKeyStore(store, keysFile);
+  return { folderId: folder.id, folderPath: folder.path, key: secret, keyId: key.id, label: key.label, permission };
+}
+
+async function folderAccess(request, folderId, write = false) {
+  const secret = request.headers.authorization?.match(/^Bearer (us_live_[A-Za-z0-9_-]+)$/)?.[1];
+  if (!secret) return null;
+  const store = await keyStore();
+  const folder = store.folders.find((item) => item.id === folderId);
+  const hash = keyHash(secret);
+  const key = folder?.keys.find((item) => sameText(item.hash, hash));
+  if (!folder || !key || (write && key.permission !== "write")) return null;
+  const root = safePath(SHARED_ROOT, folder.path);
+  if (!(await stat(root)).isDirectory()) return null;
+  return { folder, key, root };
+}
 
 async function uploadSession(id) {
   if (typeof id !== "string" || !/^[0-9a-f-]{36}$/.test(id)) return null;
@@ -294,12 +340,91 @@ async function status() {
   };
 }
 
+function streamFile(request, response, target, info, head = false) {
+  const headers = {
+    "Content-Type": "application/octet-stream",
+    "Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(path.basename(target))}`,
+    "Accept-Ranges": "bytes",
+    "X-Content-Type-Options": "nosniff",
+  };
+  const range = request.headers.range?.match(/^bytes=(\d*)-(\d*)$/);
+  if (range) {
+    const start = range[1] ? Number(range[1]) : 0;
+    const end = range[2] ? Math.min(Number(range[2]), info.size - 1) : info.size - 1;
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || start >= info.size) {
+      response.writeHead(416, { "Content-Range": `bytes */${info.size}` });
+      return response.end();
+    }
+    response.writeHead(206, { ...headers, "Content-Length": end - start + 1, "Content-Range": `bytes ${start}-${end}/${info.size}` });
+    return head ? response.end() : createReadStream(target, { start, end }).pipe(response);
+  }
+  response.writeHead(200, { ...headers, "Content-Length": info.size });
+  return head ? response.end() : createReadStream(target).pipe(response);
+}
+
+async function publicFolderApi(request, response, url) {
+  const match = url.pathname.match(/^\/api\/v1\/folders\/([0-9a-f-]{36})\/files(?:\/(.*))?$/);
+  if (!match) return false;
+  const relative = decodeURIComponent(match[2] || "");
+  const write = request.method === "PUT" || request.method === "DELETE";
+  const access = await folderAccess(request, match[1], write);
+  if (!access) {
+    json(response, write ? 403 : 401, { error: write ? "쓰기 권한이 없습니다." : "유효한 API 키가 필요합니다." });
+    return true;
+  }
+  const target = safePath(access.root, relative);
+  if ((request.method === "GET" || request.method === "HEAD") && await exists(target)) {
+    const info = await stat(target);
+    if (info.isFile()) return Boolean(streamFile(request, response, target, info, request.method === "HEAD") || true);
+    if (!info.isDirectory()) throw new Error("지원하지 않는 파일 형식입니다.");
+    const entries = await readdir(target, { withFileTypes: true });
+    json(response, 200, { folderId: access.folder.id, path: relative, entries: await Promise.all(entries.filter((entry) => !entry.name.startsWith(".")).map(async (entry) => {
+      const info = await stat(path.join(target, entry.name));
+      return { name: entry.name, path: path.posix.join(relative, entry.name), directory: entry.isDirectory(), size: info.size, updatedAt: info.mtime.toISOString() };
+    })) });
+    return true;
+  }
+  if (request.method === "PUT") {
+    if (!relative || !validName(path.basename(relative))) throw new Error("파일 경로가 필요합니다.");
+    const length = Number(request.headers["content-length"] || 0);
+    if (!length || length > MAX_UPLOAD) throw new Error("Content-Length가 필요하며 파일은 5GB 이하여야 합니다.");
+    await mkdir(path.dirname(target), { recursive: true });
+    try { await pipeline(request, createWriteStream(target, { flags: "wx", mode: 0o640 })); }
+    catch (error) { await rm(target, { force: true }); if (error.code === "EEXIST") throw new Error("같은 경로의 파일이 이미 있습니다."); throw error; }
+    json(response, 201, { message: "업로드 완료", path: relative });
+    return true;
+  }
+  if (request.method === "DELETE" && await exists(target) && target !== access.root) {
+    await rm(target, { recursive: true });
+    json(response, 200, { message: "삭제 완료" });
+    return true;
+  }
+  json(response, 404, { error: "파일을 찾을 수 없습니다." });
+  return true;
+}
+
 async function apiRequest(request, response, url) {
   if (!checkOrigin(request)) return json(response, 403, { error: "다른 웹사이트에서 보낸 요청은 거부됩니다." });
   if (request.method === "OPTIONS") return json(response, 204, {});
 
   if (request.method === "GET" && url.pathname === "/api/status") return json(response, 200, await status());
   if (request.method === "GET" && url.pathname === "/api/projects") return json(response, 200, { projects: await projects() });
+  if (request.method === "GET" && url.pathname === "/api/folder-keys") {
+    const relative = path.relative(SHARED_ROOT, safePath(SHARED_ROOT, url.searchParams.get("path") || ""));
+    const folder = (await keyStore()).folders.find((item) => item.path === relative);
+    return json(response, 200, { folderId: folder?.id || null, keys: (folder?.keys || []).map((key) => ({ id: key.id, label: key.label, permission: key.permission, createdAt: key.createdAt })) });
+  }
+  if (request.method === "POST" && url.pathname === "/api/folder-keys") {
+    const body = await readJson(request);
+    return json(response, 201, await issueFolderKey(body.path || "", body.label, body.permission));
+  }
+  if (request.method === "DELETE" && url.pathname === "/api/folder-keys") {
+    const body = await readJson(request);
+    const store = await keyStore();
+    for (const folder of store.folders) folder.keys = folder.keys.filter((key) => key.id !== body.keyId);
+    await saveKeyStore(store);
+    return json(response, 200, { message: "API 키를 폐기했습니다." });
+  }
   if (request.method === "GET" && url.pathname === "/api/files") {
     return json(response, 200, { entries: await files(url.searchParams.get("space") || "projects", url.searchParams.get("path") || "") });
   }
@@ -615,6 +740,9 @@ export function startHub() {
       requestPath = url.pathname;
       if (url.pathname === "/login" && request.method === "GET") return loginPage(response);
       if (url.pathname === "/login" && request.method === "POST") return await login(request, response);
+      if (url.pathname.startsWith("/api/v1/folders/")) {
+        if (await publicFolderApi(request, response, url)) return;
+      }
       if (requireLogin(request, response, url)) return;
       if (url.pathname.startsWith("/api/")) return await apiRequest(request, response, url);
       return proxy(request, response);

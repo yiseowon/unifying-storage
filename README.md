@@ -18,6 +18,8 @@
 - 공용 로그인 화면과 12시간 HttpOnly 세션
 - 저장소 밖으로 이동하는 경로 탐색 차단
 - 실행 중인 관리 프로젝트 삭제 방지
+- 폴더별 읽기/쓰기 API 키 발급·폐기
+- 대용량 데이터셋용 HTTP Range 스트리밍 API
 
 ## 화면 구조
 
@@ -91,6 +93,7 @@ npm run hub
 | `HUB_GIT` | `/usr/bin/git` | Git 실행 파일 경로 |
 | `HUB_COLIMA` | `/opt/homebrew/bin/colima` | Colima 실행 파일 경로 |
 | `HUB_NO_FRONTEND` | `0` | `1`이면 API만 실행 |
+| `HUB_API_KEYS_FILE` | `~/.unifying-storage/api-keys.json` | API 키 해시와 폴더 연결 정보 저장 위치 |
 
 로그인 정보가 없으면 모든 요청이 거부됩니다. 비밀번호를 저장소나 LaunchAgent 파일에 직접 커밋하지 말고, 운영 환경의 권한이 제한된 설정 파일이나 비밀 관리 기능을 사용하세요.
 
@@ -144,6 +147,164 @@ ZIP 폴더 업로드는 전송 후 macOS `ditto`로 자동 해제됩니다.
 - 심볼릭 링크와 특수 파일은 거부합니다.
 - 같은 이름의 대상이 이미 있으면 덮어쓰지 않고 실패합니다.
 - 파일 한 개의 최대 크기는 5GB입니다.
+
+## 폴더 API 사용 설명서
+
+폴더별 API를 사용하면 팀원의 Python 코드나 서버가 브라우저를 거치지 않고 데이터셋에 접근할 수 있습니다. 별도의 서버 비밀번호를 코드에 넣을 필요는 없습니다. 공개 HTTPS 주소와 폴더 ID, 폴더 API 키 세 가지만 사용합니다.
+
+### 1. API 키 발급
+
+1. 관리자 계정으로 Unifying Storage 웹에 로그인합니다.
+2. 공유 저장소에서 데이터셋 폴더 오른쪽의 열쇠 아이콘을 누릅니다.
+3. 키 이름과 권한을 선택하고 **새 키 발급**을 누릅니다.
+4. 표시된 `us_live_...` 키와 Folder ID를 즉시 복사합니다.
+
+키 원문은 발급 직후 한 번만 표시됩니다. 서버에는 키의 SHA-256 해시만 저장되므로 잃어버렸다면 기존 키를 폐기하고 새로 발급해야 합니다.
+
+권한은 두 종류입니다.
+
+| 권한 | 가능한 작업 |
+| --- | --- |
+| 읽기 전용 | 폴더 목록, 파일 다운로드, Range 요청 |
+| 읽기·쓰기·삭제 | 읽기 작업, 새 파일 업로드, 파일·하위 폴더 삭제 |
+
+팀원이나 실행 서버마다 키를 따로 발급하세요. 키가 유출되면 해당 키만 폐기할 수 있습니다.
+
+### 2. 환경변수 설정
+
+API 키를 Git 저장소의 소스 코드나 `.env` 파일에 커밋하면 안 됩니다. 셸 또는 배포 서비스의 Secret 기능에 등록하세요.
+
+```bash
+export STORAGE_URL="https://storage.example.com"
+export STORAGE_FOLDER_ID="발급된-Folder-ID"
+export STORAGE_API_KEY="us_live_발급된_API_키"
+```
+
+`.env`를 사용한다면 반드시 `.gitignore`에 포함되어 있는지 확인합니다. 이 저장소는 기본적으로 `.env*`를 무시합니다.
+
+### 3. 파일 목록 보기
+
+루트 목록:
+
+```bash
+curl -H "Authorization: Bearer $STORAGE_API_KEY" \
+  "$STORAGE_URL/api/v1/folders/$STORAGE_FOLDER_ID/files"
+```
+
+하위 폴더 목록:
+
+```bash
+curl -H "Authorization: Bearer $STORAGE_API_KEY" \
+  "$STORAGE_URL/api/v1/folders/$STORAGE_FOLDER_ID/files/train/images"
+```
+
+응답 예시:
+
+```json
+{
+  "folderId": "b19a96f4-7e78-4f86-95b1-7bfe0eb5cb1a",
+  "path": "train",
+  "entries": [
+    { "name": "labels.csv", "path": "train/labels.csv", "directory": false, "size": 42010 }
+  ]
+}
+```
+
+### 4. 파일 다운로드
+
+```bash
+curl -L \
+  -H "Authorization: Bearer $STORAGE_API_KEY" \
+  "$STORAGE_URL/api/v1/folders/$STORAGE_FOLDER_ID/files/train/labels.csv" \
+  -o labels.csv
+```
+
+대용량 다운로드를 이어받으려면 `-C -`를 추가합니다. 서버는 `Range`와 `HEAD` 요청을 지원합니다.
+
+```bash
+curl -C - -L \
+  -H "Authorization: Bearer $STORAGE_API_KEY" \
+  "$STORAGE_URL/api/v1/folders/$STORAGE_FOLDER_ID/files/model.bin" \
+  -o model.bin
+```
+
+### 5. Python에서 데이터셋 사용
+
+추가 라이브러리 없이 파일을 내려받는 예시입니다.
+
+```python
+import os
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+base = os.environ["STORAGE_URL"]
+folder_id = os.environ["STORAGE_FOLDER_ID"]
+api_key = os.environ["STORAGE_API_KEY"]
+remote_path = "train/labels.csv"
+
+request = Request(
+    f"{base}/api/v1/folders/{folder_id}/files/{remote_path}",
+    headers={"Authorization": f"Bearer {api_key}"},
+)
+
+with urlopen(request, timeout=60) as response:
+    Path("labels.csv").write_bytes(response.read())
+```
+
+`pandas`로 바로 읽을 때는 인증 헤더를 전달할 수 있는 `requests`를 함께 사용합니다.
+
+```python
+import io
+import os
+import pandas as pd
+import requests
+
+url = (
+    f"{os.environ['STORAGE_URL']}/api/v1/folders/"
+    f"{os.environ['STORAGE_FOLDER_ID']}/files/train/labels.csv"
+)
+response = requests.get(
+    url,
+    headers={"Authorization": f"Bearer {os.environ['STORAGE_API_KEY']}"},
+    timeout=60,
+)
+response.raise_for_status()
+dataset = pd.read_csv(io.BytesIO(response.content))
+```
+
+### 6. 파일 업로드와 삭제
+
+쓰기 권한 키가 필요합니다. 중간 폴더가 없으면 업로드 시 자동 생성됩니다. 기존 파일은 실수로 덮어쓰지 않습니다.
+
+```bash
+curl -X PUT \
+  -H "Authorization: Bearer $STORAGE_API_KEY" \
+  -H "Content-Type: application/octet-stream" \
+  --data-binary @result.csv \
+  "$STORAGE_URL/api/v1/folders/$STORAGE_FOLDER_ID/files/results/result.csv"
+```
+
+```bash
+curl -X DELETE \
+  -H "Authorization: Bearer $STORAGE_API_KEY" \
+  "$STORAGE_URL/api/v1/folders/$STORAGE_FOLDER_ID/files/results/result.csv"
+```
+
+### 7. 키 폐기
+
+웹의 열쇠 아이콘을 다시 누르고 대상 키의 **폐기**를 누릅니다. 폐기 즉시 해당 키를 사용하는 모든 요청이 거부됩니다.
+
+### API 주소 요약
+
+| 메서드 | 주소 | 설명 |
+| --- | --- | --- |
+| `GET` | `/api/v1/folders/:folderId/files` | 폴더 루트 목록 |
+| `GET` | `/api/v1/folders/:folderId/files/*` | 하위 목록 또는 파일 스트리밍 |
+| `HEAD` | `/api/v1/folders/:folderId/files/*` | 파일 크기·Range 확인 |
+| `PUT` | `/api/v1/folders/:folderId/files/*` | 새 파일 업로드 |
+| `DELETE` | `/api/v1/folders/:folderId/files/*` | 파일 또는 하위 폴더 삭제 |
+
+모든 요청은 `Authorization: Bearer us_live_...` 헤더가 필요합니다. 브라우저 관리자 로그인 비밀번호는 이 API에서 사용하지 않습니다.
 
 ## 개발
 

@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Download, File, FileText, Folder, FolderUp, HardDrive, Music2, Pencil, Search, Trash2, X } from "lucide-react";
+import { Copy, Download, File, FileText, Folder, FolderUp, HardDrive, KeyRound, Music2, Pencil, Search, Trash2, X } from "lucide-react";
 
 type Disk = { used: number; total: number; percent: number; mount: string };
 type HubStatus = {
@@ -30,6 +30,8 @@ type UploadProgress = {
   error?: string;
 };
 type Preview = { entry: FileEntry; kind: "audio" | "text"; content: string; loading: boolean; error?: string };
+type FolderKey = { id: string; label: string; permission: "read" | "write"; createdAt: string };
+type KeyPanel = { entry: FileEntry; folderId: string | null; keys: FolderKey[]; revealed?: string };
 
 const textExtensions = /\.(txt|md|json|csv|log|js|jsx|ts|tsx|css|html|xml|yml|yaml|py|sh)$/i;
 const previewKind = (name: string) => name.toLowerCase().endsWith(".mp3") ? "audio" : textExtensions.test(name) ? "text" : null;
@@ -85,6 +87,9 @@ export default function Home() {
   const [renameEntry, setRenameEntry] = useState<FileEntry | null>(null);
   const [renameName, setRenameName] = useState("");
   const [preview, setPreview] = useState<Preview | null>(null);
+  const [keyPanel, setKeyPanel] = useState<KeyPanel | null>(null);
+  const [keyLabel, setKeyLabel] = useState("hackathon");
+  const [keyPermission, setKeyPermission] = useState<"read" | "write">("read");
   const activeUploads = useRef(new Set<XMLHttpRequest>());
   const activeUploadSession = useRef("");
   const uploadCancelled = useRef(false);
@@ -394,6 +399,29 @@ export default function Home() {
     }
   };
 
+  const openKeys = async (entry: FileEntry) => {
+    try {
+      const data = await api<{ folderId: string | null; keys: FolderKey[] }>(`/api/folder-keys?${new URLSearchParams({ path: entry.path })}`);
+      setKeyPanel({ entry, ...data });
+    } catch (error) { setNotice(error instanceof Error ? error.message : "API 키를 불러오지 못했습니다."); }
+  };
+
+  const createKey = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!keyPanel) return;
+    try {
+      const created = await api<{ folderId: string; keyId: string; key: string; label: string; permission: "read" | "write" }>("/api/folder-keys", { method: "POST", body: JSON.stringify({ path: keyPanel.entry.path, label: keyLabel, permission: keyPermission }) });
+      setKeyPanel((current) => current ? { ...current, folderId: created.folderId, revealed: created.key, keys: [...current.keys, { id: created.keyId, label: created.label, permission: created.permission, createdAt: new Date().toISOString() }] } : current);
+      setNotice("API 키를 발급했습니다. 지금 복사해 안전하게 보관하세요.");
+    } catch (error) { setNotice(error instanceof Error ? error.message : "API 키 발급 실패"); }
+  };
+
+  const revokeKey = async (key: FolderKey) => {
+    if (!window.confirm(`“${key.label}” 키를 폐기할까요? 즉시 접속할 수 없게 됩니다.`)) return;
+    await api("/api/folder-keys", { method: "DELETE", body: JSON.stringify({ keyId: key.id }) });
+    setKeyPanel((current) => current ? { ...current, keys: current.keys.filter((item) => item.id !== key.id), revealed: undefined } : current);
+  };
+
   const downloadUrl = (entry: FileEntry) => `${apiBase()}/api/download?${new URLSearchParams({ space, path: entry.path })}`;
   const previewUrl = (entry: FileEntry) => `${apiBase()}/api/preview?${new URLSearchParams({ space, path: entry.path })}`;
   const openPreview = async (entry: FileEntry) => {
@@ -498,7 +526,7 @@ export default function Home() {
             {path && <button className="file-row" onClick={() => goTo(path.split("/").slice(0, -1).join("/"))}><span>‹ 상위 폴더</span><span>—</span><span>—</span><span /></button>}
             {visibleFiles.map((entry) => {
               const protectedEntry = entry.path === "Developer" || entry.path === "Developer/mac-hub";
-              return <div className="file-row" key={entry.path}><button className={`file-name${!entry.directory && previewKind(entry.name) ? " previewable" : ""}`} onClick={() => entry.directory ? goTo(entry.path) : openPreview(entry)}>{entry.directory ? <Folder className="entry-icon folder-entry-icon" size={22} strokeWidth={1.7} aria-hidden="true" /> : <File className="entry-icon" size={21} strokeWidth={1.7} aria-hidden="true" />}{entry.name}</button><span>{fileSize(entry.size)}</span><span>{relativeTime(entry.updatedAt)}</span><span className="row-actions">{entry.directory && <button className="icon-action project-action" onClick={() => addProject(entry)} disabled={busy === `project:${entry.path}`} aria-label={`${entry.name} 프로젝트로 추가`} title="프로젝트로 추가"><FolderUp size={18} strokeWidth={1.8} /></button>}<a className="icon-action download-action" href={downloadUrl(entry)} aria-label={`${entry.name} 다운로드`} title="다운로드"><Download size={18} strokeWidth={1.8} /></a><button className="icon-action edit-action" onClick={() => beginRename(entry)} aria-label={`${entry.name} 이름 변경`} title="이름 변경"><Pencil size={17} strokeWidth={1.8} /></button><button className="icon-action delete-file" onClick={() => deleteFile(entry)} disabled={protectedEntry || busy === `file-delete:${entry.path}`} aria-label={`${entry.name} 삭제`} title={protectedEntry ? "관리 폴더는 삭제할 수 없습니다" : "삭제"}><Trash2 size={17} strokeWidth={1.8} /></button></span></div>;
+              return <div className="file-row" key={entry.path}><button className={`file-name${!entry.directory && previewKind(entry.name) ? " previewable" : ""}`} onClick={() => entry.directory ? goTo(entry.path) : openPreview(entry)}>{entry.directory ? <Folder className="entry-icon folder-entry-icon" size={22} strokeWidth={1.7} aria-hidden="true" /> : <File className="entry-icon" size={21} strokeWidth={1.7} aria-hidden="true" />}{entry.name}</button><span>{fileSize(entry.size)}</span><span>{relativeTime(entry.updatedAt)}</span><span className="row-actions">{entry.directory && <button className="icon-action key-action" onClick={() => openKeys(entry)} aria-label={`${entry.name} API 키 관리`} title="API 키 관리"><KeyRound size={17} strokeWidth={1.8} /></button>}{entry.directory && <button className="icon-action project-action" onClick={() => addProject(entry)} disabled={busy === `project:${entry.path}`} aria-label={`${entry.name} 프로젝트로 추가`} title="프로젝트로 추가"><FolderUp size={18} strokeWidth={1.8} /></button>}<a className="icon-action download-action" href={downloadUrl(entry)} aria-label={`${entry.name} 다운로드`} title="다운로드"><Download size={18} strokeWidth={1.8} /></a><button className="icon-action edit-action" onClick={() => beginRename(entry)} aria-label={`${entry.name} 이름 변경`} title="이름 변경"><Pencil size={17} strokeWidth={1.8} /></button><button className="icon-action delete-file" onClick={() => deleteFile(entry)} disabled={protectedEntry || busy === `file-delete:${entry.path}`} aria-label={`${entry.name} 삭제`} title={protectedEntry ? "관리 폴더는 삭제할 수 없습니다" : "삭제"}><Trash2 size={17} strokeWidth={1.8} /></button></span></div>;
             })}
             {!visibleFiles.length && <Empty text={search ? "검색 결과가 없습니다." : "파일이 없습니다."} />}
           </div>
@@ -517,6 +545,17 @@ export default function Home() {
             {preview.kind === "audio" ? <audio controls autoPlay preload="metadata" src={previewUrl(preview.entry)}>오디오 재생을 지원하지 않는 브라우저입니다.</audio> : preview.loading ? <div className="preview-message">불러오는 중…</div> : preview.error ? <div className="preview-message error">{preview.error}</div> : <pre>{preview.content}</pre>}
           </div>
           <footer className="preview-footer"><a href={downloadUrl(preview.entry)}><Download size={16} />다운로드</a></footer>
+        </section>
+      </div>}
+      {keyPanel && <div className="preview-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setKeyPanel(null); }}>
+        <section className="key-dialog" role="dialog" aria-modal="true" aria-labelledby="key-title">
+          <header className="preview-header"><span className="preview-type-icon"><KeyRound size={20} /></span><div><h2 id="key-title">{keyPanel.entry.name} API 키</h2><p>이 폴더 안에서만 사용할 수 있습니다.</p></div><button className="preview-close" onClick={() => setKeyPanel(null)} aria-label="API 키 창 닫기"><X size={19} /></button></header>
+          <div className="key-content">
+            {keyPanel.revealed && <div className="revealed-key"><strong>지금 한 번만 표시됩니다</strong><code>{keyPanel.revealed}</code><button onClick={() => navigator.clipboard.writeText(keyPanel.revealed || "")}><Copy size={15} /> 복사</button></div>}
+            {keyPanel.folderId && <div className="endpoint"><span>Folder ID</span><code>{keyPanel.folderId}</code></div>}
+            <div className="key-list">{keyPanel.keys.map((key) => <div key={key.id}><span><strong>{key.label}</strong><small>{key.permission === "write" ? "읽기·쓰기·삭제" : "읽기 전용"} · {new Date(key.createdAt).toLocaleDateString("ko-KR")}</small></span><button onClick={() => revokeKey(key)}>폐기</button></div>)}{!keyPanel.keys.length && <Empty text="아직 발급된 키가 없습니다." />}</div>
+            <form className="key-form" onSubmit={createKey}><input value={keyLabel} onChange={(event) => setKeyLabel(event.target.value)} placeholder="키 이름" maxLength={80} required /><select value={keyPermission} onChange={(event) => setKeyPermission(event.target.value as "read" | "write")}><option value="read">읽기 전용</option><option value="write">읽기·쓰기·삭제</option></select><button>새 키 발급</button></form>
+          </div>
         </section>
       </div>}
     </main>

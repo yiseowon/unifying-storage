@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
-import { authorized, cloneName, deletableProjectName, deletableSharedPath, safePath, sessionToken, validName, validSession } from "../hub-server.mjs";
+import { authorized, cloneName, deletableProjectName, deletableSharedPath, issueFolderKey, safePath, sessionToken, validName, validSession } from "../hub-server.mjs";
 
 test("public access requires the shared team login", () => {
   const header = `Basic ${Buffer.from("hackathon:correct horse").toString("base64")}`;
@@ -94,4 +96,20 @@ test("file rows expose protected delete actions and custom login UI", async () =
   assert.match(server, /DELETE.*\/api\/files/);
   assert.match(server, /팀 워크스페이스에 접속하려면 로그인하세요/);
   assert.match(server, /HttpOnly; Secure; SameSite=Strict/);
+});
+
+test("folder API keys are unique and stored only as hashes", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "unifying-storage-test-"));
+  const keysFile = path.join(root, "config", "keys.json");
+  try {
+    await mkdir(path.join(root, "dataset"));
+    const first = await issueFolderKey("dataset", "reader", "read", root, keysFile);
+    const second = await issueFolderKey("dataset", "writer", "write", root, keysFile);
+    assert.match(first.key, /^us_live_[A-Za-z0-9_-]{43}$/);
+    assert.notEqual(first.key, second.key);
+    assert.equal(first.folderId, second.folderId);
+    const stored = await readFile(keysFile, "utf8");
+    assert.doesNotMatch(stored, new RegExp(first.key));
+    assert.match(stored, /"permission": "write"/);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
