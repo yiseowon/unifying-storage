@@ -85,6 +85,7 @@ test("ZIP folder uploads are extracted server-side and can be cancelled", async 
   assert.match(server, /path\.basename\(session\.name, path\.extname\(session\.name\)\)/);
   assert.match(page, /Math\.min\(4, session\.total\)/);
   assert.match(page, /\/s · 약/);
+  assert.doesNotMatch(server, /MAX_UPLOAD|5GB 이하/);
 });
 
 test("file rows expose protected delete actions and custom login UI", async () => {

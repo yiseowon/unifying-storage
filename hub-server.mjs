@@ -22,7 +22,6 @@ const DITTO = process.env.HUB_DITTO || "/usr/bin/ditto";
 const MEMORY_PRESSURE = process.env.HUB_MEMORY_PRESSURE || "/usr/bin/memory_pressure";
 const NPM = process.env.HUB_NPM || "npm";
 const MAX_JSON = 1024 * 1024;
-const MAX_UPLOAD = 5 * 1024 * 1024 * 1024;
 const MAX_TEXT_PREVIEW = 10 * 1024 * 1024;
 const TEXT_EXTENSIONS = new Set([".txt", ".md", ".json", ".csv", ".log", ".js", ".jsx", ".ts", ".tsx", ".css", ".html", ".xml", ".yml", ".yaml", ".py", ".sh"]);
 const SESSION_SECONDS = 12 * 60 * 60;
@@ -387,7 +386,7 @@ async function publicFolderApi(request, response, url) {
   if (request.method === "PUT") {
     if (!relative || !validName(path.basename(relative))) throw new Error("파일 경로가 필요합니다.");
     const length = Number(request.headers["content-length"] || 0);
-    if (!length || length > MAX_UPLOAD) throw new Error("Content-Length가 필요하며 파일은 5GB 이하여야 합니다.");
+    if (!Number.isSafeInteger(length) || length <= 0) throw new Error("올바른 Content-Length가 필요합니다.");
     await mkdir(path.dirname(target), { recursive: true });
     try { await pipeline(request, createWriteStream(target, { flags: "wx", mode: 0o640 })); }
     catch (error) { await rm(target, { force: true }); if (error.code === "EEXIST") throw new Error("같은 경로의 파일이 이미 있습니다."); throw error; }
@@ -570,7 +569,7 @@ async function apiRequest(request, response, url) {
 
   if (request.method === "POST" && url.pathname === "/api/upload-sessions") {
     const body = await readJson(request);
-    if (!Number.isSafeInteger(body.size) || body.size <= 0 || body.size > MAX_UPLOAD) throw new Error("파일 크기는 5GB 이하여야 합니다.");
+    if (!Number.isSafeInteger(body.size) || body.size <= 0) throw new Error("올바른 파일 크기가 필요합니다.");
     if (!validName(body.name) || (body.archive && path.extname(body.name).toLowerCase() !== ".zip")) throw new Error("사용할 수 없는 파일 이름입니다.");
     const root = rootFor(body.space);
     const parent = safePath(root, body.path || "");
@@ -642,7 +641,7 @@ async function apiRequest(request, response, url) {
 
   if (request.method === "PUT" && url.pathname === "/api/upload") {
     const length = Number(request.headers["content-length"] || 0);
-    if (!length || length > MAX_UPLOAD) throw new Error("파일 크기는 5GB 이하여야 합니다.");
+    if (!Number.isSafeInteger(length) || length <= 0) throw new Error("올바른 Content-Length가 필요합니다.");
     const name = url.searchParams.get("name") || "";
     if (!validName(name)) throw new Error("사용할 수 없는 파일 이름입니다.");
     const root = rootFor(url.searchParams.get("space") || "projects");
@@ -661,7 +660,7 @@ async function apiRequest(request, response, url) {
 
   if (request.method === "PUT" && url.pathname === "/api/upload-archive") {
     const length = Number(request.headers["content-length"] || 0);
-    if (!length || length > MAX_UPLOAD) throw new Error("ZIP 파일 크기는 5GB 이하여야 합니다.");
+    if (!Number.isSafeInteger(length) || length <= 0) throw new Error("올바른 Content-Length가 필요합니다.");
     const name = url.searchParams.get("name") || "";
     if (!validName(name) || path.extname(name).toLowerCase() !== ".zip") throw new Error("ZIP 파일만 업로드할 수 있습니다.");
     const root = rootFor(url.searchParams.get("space") || "shared");
