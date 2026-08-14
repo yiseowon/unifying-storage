@@ -29,6 +29,7 @@ const UPLOAD_CHUNK = 16 * 1024 * 1024;
 const UPLOAD_SESSIONS = path.join(os.tmpdir(), "mac-hub-upload-sessions");
 const API_KEYS_FILE = process.env.HUB_API_KEYS_FILE || path.join(USER_HOME, ".unifying-storage", "api-keys.json");
 const uploadSessions = new Map();
+let updateRunning = false;
 
 async function keyStore(file = API_KEYS_FILE) {
   try { return JSON.parse(await readFile(file, "utf8")); }
@@ -168,6 +169,7 @@ const exists = async (target) => access(target).then(() => true, () => false);
 async function command(file, args = [], options = {}) {
   try {
     const { stdout, stderr } = await execute(file, args, {
+      cwd: options.cwd,
       timeout: options.timeout ?? 15000,
       maxBuffer: options.maxBuffer ?? 2 * 1024 * 1024,
       env: {
@@ -313,13 +315,14 @@ async function validateArchiveTree(target) {
 async function status() {
   const interfaces = os.networkInterfaces();
   const tailAddress = Object.values(interfaces).flat().find((item) => item?.family === "IPv4" && item.address.startsWith("100."))?.address || "";
-  const [tailscale, ssh, colima, memoryPressure, systemDisk, sharedDisk] = await Promise.all([
+  const [tailscale, ssh, colima, memoryPressure, systemDisk, sharedDisk, revision] = await Promise.all([
     command(SCUTIL, ["--nc", "list"]),
     command(NC, ["-z", "-w", "2", "127.0.0.1", "22"]),
     command(COLIMA, ["status"]),
     command(MEMORY_PRESSURE, ["-Q"]),
     disk("/System/Volumes/Data"),
     disk(SHARED_ROOT),
+    command(GIT, ["-C", APP_DIR, "rev-parse", "--short", "HEAD"]),
   ]);
   const total = os.totalmem();
   const availablePercent = Number(memoryPressure.stdout.match(/free percentage:\s*(\d+)/i)?.[1] || 0);
@@ -335,6 +338,8 @@ async function status() {
     docker: { running: colima.ok && /colima is running/i.test(`${colima.stdout} ${colima.stderr}`), detail: colima.ok ? colima.stdout : "정지" },
     disks: { system: systemDisk, shared: sharedDisk },
     sharedReady: Boolean(sharedDisk),
+    revision: revision.ok ? revision.stdout : "",
+    updateRunning,
     updatedAt: new Date().toISOString(),
   };
 }
@@ -692,6 +697,26 @@ async function apiRequest(request, response, url) {
 
   if (request.method === "POST" && url.pathname.startsWith("/api/actions/")) {
     const action = url.pathname.split("/").at(-1);
+    if (action === "update") {
+      if (updateRunning) throw new Error("이미 업데이트 중입니다.");
+      updateRunning = true;
+      try {
+        const dirty = await command(GIT, ["-C", APP_DIR, "status", "--porcelain"]);
+        if (!dirty.ok || dirty.stdout) throw new Error("서버 소스에 로컬 변경이 있어 안전하게 업데이트할 수 없습니다.");
+        const fetch = await command(GIT, ["-C", APP_DIR, "fetch", "origin", "main"], { timeout: 120000 });
+        if (!fetch.ok) throw new Error(`GitHub 확인 실패: ${fetch.stderr}`);
+        const merge = await command(GIT, ["-C", APP_DIR, "merge", "--ff-only", "origin/main"], { timeout: 30000 });
+        if (!merge.ok) throw new Error(`업데이트 적용 실패: ${merge.stderr}`);
+        const install = await command(NPM, ["ci"], { cwd: APP_DIR, timeout: 600000, maxBuffer: 5 * 1024 * 1024 });
+        if (!install.ok) throw new Error(`패키지 설치 실패: ${install.stderr}`);
+        const build = await command(NPM, ["run", "build"], { cwd: APP_DIR, timeout: 600000, maxBuffer: 5 * 1024 * 1024 });
+        if (!build.ok) throw new Error(`빌드 실패: ${build.stderr}`);
+        json(response, 200, { message: "새 버전을 적용했습니다. 잠시 후 자동으로 새로고침됩니다." });
+        const label = process.env.HUB_LAUNCH_LABEL || `gui/${process.getuid()}/com.iseowon.mac-hub`;
+        setTimeout(() => execFile("/bin/launchctl", ["kickstart", "-k", label]), 500);
+        return;
+      } finally { updateRunning = false; }
+    }
     const actions = {
       "docker-start": [COLIMA, ["start", "--cpu", "4", "--memory", "6", "--disk", "60"]],
       "docker-stop": [COLIMA, ["stop"]],

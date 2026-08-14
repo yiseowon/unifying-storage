@@ -114,3 +114,15 @@ test("folder API keys are unique and stored only as hashes", async () => {
     assert.match(stored, /"permission": "write"/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
+
+test("admin update is fixed to origin/main and refuses dirty source", async () => {
+  const [page, server] = await Promise.all([
+    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../hub-server.mjs", import.meta.url), "utf8"),
+  ]);
+  assert.match(page, /GitHub에서 업데이트/);
+  assert.match(server, /"fetch", "origin", "main"/);
+  assert.match(server, /"merge", "--ff-only", "origin\/main"/);
+  assert.match(server, /status", "--porcelain"/);
+  assert.doesNotMatch(server, /reset", "--hard"/);
+});
