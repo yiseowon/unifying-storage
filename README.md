@@ -316,6 +316,24 @@ npm test
 
 `npm test`는 프로덕션 빌드 후 Node 기본 테스트 러너로 경로 검증, 로그인 세션, 삭제 보호, ZIP 및 병렬 업로드 구조를 확인합니다.
 
+## SSH 없이 GitHub에서 업데이트
+
+관리 화면의 **GitHub에서 업데이트** 버튼은 고정된 `origin/main`만 받아 `npm ci`, 프로덕션 빌드, LaunchAgent 재시작을 순서대로 수행합니다. 서버 소스에 커밋하지 않은 변경이 있으면 강제로 덮어쓰지 않고 중단합니다.
+
+이 버튼이 없는 기존 설치본은 최초 한 번 Mac에서 직접 새 저장소로 교체해야 합니다. 운영 설정과 파일은 소스 밖에 보관한 후 진행하세요.
+
+```bash
+launchctl bootout "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.iseowon.mac-hub.plist"
+mv "$HOME/Developer/mac-hub" "$HOME/.unifying-storage/backups/mac-hub-before-web-update"
+git clone https://github.com/yiseowon/unifying-storage.git "$HOME/Developer/mac-hub"
+cd "$HOME/Developer/mac-hub"
+npm ci
+npm run build
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.iseowon.mac-hub.plist"
+```
+
+이후부터는 `storage.plany.life`에서 버튼만 눌러 업데이트할 수 있습니다. 기본 LaunchAgent 라벨이 다르면 `HUB_LAUNCH_LABEL`에 `gui/UID/라벨`을 설정합니다.
+
 ## 보안 주의사항
 
 이 앱은 파일 생성·삭제와 Git 명령을 수행합니다. 인터넷에 공개하기 전에 반드시 다음을 확인하세요.

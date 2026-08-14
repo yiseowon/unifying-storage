@@ -14,6 +14,8 @@ type HubStatus = {
   disks: { system: Disk; shared: Disk | null };
   sharedReady: boolean;
   updatedAt: string;
+  revision: string;
+  updateRunning: boolean;
 };
 
 type Project = { name: string; path: string; git: boolean; branch: string; changes: number; updatedAt: string };
@@ -156,6 +158,12 @@ export default function Home() {
     } finally {
       setBusy("");
     }
+  };
+
+  const updateServer = async () => {
+    if (!window.confirm("GitHub main의 새 버전을 받아 빌드하고 서버를 재시작할까요?")) return;
+    await run("update", "GitHub 업데이트");
+    window.setTimeout(() => window.location.reload(), 5000);
   };
 
   const createProject = async (event: FormEvent) => {
@@ -483,6 +491,7 @@ export default function Home() {
           <ServiceRow name="SSH" value={status?.ssh ? "키 인증" : "확인 필요"} active={Boolean(status?.ssh)} />
           <ServiceRow name="Docker" value={status?.docker.running ? "실행 중" : "정지"} active={Boolean(status?.docker.running)} action={<button onClick={() => run(status?.docker.running ? "docker-stop" : "docker-start", "Docker")} disabled={busy.startsWith("docker")}>{status?.docker.running ? "중지" : "시작"}</button>} />
           <ServiceRow name="Storage" value={status?.sharedReady ? "온라인 · 읽기/쓰기" : "연결 확인 필요"} active={Boolean(status?.sharedReady)} />
+          <ServiceRow name="서버 버전" value={status?.revision || "확인 중"} active={Boolean(status?.revision)} action={<button onClick={updateServer} disabled={busy === "update" || status?.updateRunning}>{busy === "update" || status?.updateRunning ? "업데이트 중" : "GitHub에서 업데이트"}</button>} />
         </article>
       </section>
 
