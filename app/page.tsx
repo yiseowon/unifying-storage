@@ -1,7 +1,7 @@
 "use client";
 
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Copy, Download, File, FileText, Folder, FolderUp, HardDrive, KeyRound, Music2, Pencil, Search, Trash2, X } from "lucide-react";
+import { Copy, Download, File, FileText, Folder, FolderUp, HardDrive, KeyRound, Music2, Pencil, Search, Server, Trash2, X } from "lucide-react";
 
 type Disk = { used: number; total: number; percent: number; mount: string };
 type HubStatus = {
@@ -11,6 +11,11 @@ type HubStatus = {
   tailscale: { connected: boolean; ip: string };
   ssh: boolean;
   docker: { running: boolean; detail: string };
+  hosting: {
+    routes: { hostname: string; service: string }[];
+    containers: { name: string; image: string; ports: string; status: string }[];
+    listeners: { process: string; port: number; address: string }[];
+  };
   disks: { system: Disk; shared: Disk | null };
   sharedReady: boolean;
   updatedAt: string;
@@ -509,6 +514,15 @@ export default function Home() {
           <div className="memory-values"><span>{status ? storage(status.memory.used) : "—"} 사용</span><span>{status ? storage(status.memory.total - status.memory.used) : "—"} 사용 가능</span></div>
           <dl className="host-details"><div><dt>가동 시간</dt><dd>{status ? `${Math.floor(status.uptime / 3600)}시간` : "—"}</dd></div><div><dt>접속 주소</dt><dd>{status?.tailscale.ip || "—"}</dd></div></dl>
         </article>
+      </section>
+
+      <section className="panel hosting-panel" aria-label="호스팅 현황">
+        <div className="panel-header"><div><h2><Server size={19} strokeWidth={1.8} aria-hidden="true" /> 호스팅 현황</h2><p>{status?.hostname || "Mac mini"}에서 현재 공개·실행 중인 서비스</p></div><span className="count">{(status?.hosting.routes.length || 0) + (status?.hosting.containers.length || 0)}</span></div>
+        <div className="hosting-grid">
+          <div className="hosting-group"><h3>공개 주소</h3>{status?.hosting.routes.map((route) => <a className="hosting-row" href={`https://${route.hostname}`} target="_blank" rel="noreferrer" key={route.hostname}><span><strong>{route.hostname}</strong><small>{route.service}</small></span><i className="status-dot ok" /></a>)}{status && !status.hosting.routes.length && <p className="hosting-empty">등록된 Cloudflare 주소 없음</p>}</div>
+          <div className="hosting-group"><h3>Docker 컨테이너</h3>{status?.hosting.containers.map((container) => <div className="hosting-row" key={container.name}><span><strong>{container.name}</strong><small>{container.image}{container.ports ? ` · ${container.ports}` : ""}</small></span><em>{container.status}</em></div>)}{status && !status.hosting.containers.length && <p className="hosting-empty">실행 중인 컨테이너 없음</p>}</div>
+          <div className="hosting-group"><h3>리스닝 포트</h3>{status?.hosting.listeners.map((listener) => <div className="hosting-row" key={`${listener.process}:${listener.port}`}><span><strong>:{listener.port}</strong><small>{listener.process}</small></span><em>{listener.address}</em></div>)}{status && !status.hosting.listeners.length && <p className="hosting-empty">확인된 TCP 서비스 없음</p>}</div>
+        </div>
       </section>
 
       <section className="panel files-panel" id="files">

@@ -15,6 +15,7 @@
 - ZIP 업로드 후 서버에서 자동 압축 해제
 - Git 프로젝트 생성, GitHub 저장소 복제, 변경 상태 확인
 - Mac 메모리·가동 시간·디스크·Tailscale·SSH·Colima 상태 표시
+- Cloudflare 공개 주소·Docker 컨테이너·TCP 리스닝 포트 호스팅 현황
 - 공용 로그인 화면과 12시간 HttpOnly 세션
 - 저장소 밖으로 이동하는 경로 탐색 차단
 - 실행 중인 관리 프로젝트 삭제 방지
@@ -63,11 +64,17 @@ mkdir -p "$HOME/Developer"
 mkdir -p "/Volumes/UnifyingStorage"
 ```
 
+최초 1회, 터미널에 표시되지 않는 비밀번호를 입력해 `Administrator` 계정을 만듭니다.
+
+```bash
+read -s HUB_ADMIN_PASSWORD
+printf %s "$HUB_ADMIN_PASSWORD" | node hub-server.mjs --setup-admin
+unset HUB_ADMIN_PASSWORD
+```
+
 환경변수를 지정하고 실행합니다.
 
 ```bash
-export HUB_USER="team"
-export HUB_PASSWORD="충분히-긴-임의의-비밀번호"
 export HUB_PROJECT_ROOT="$HOME/Developer"
 export HUB_SHARED_ROOT="/Volumes/UnifyingStorage"
 export HUB_HOST="127.0.0.1"
@@ -82,8 +89,6 @@ npm run hub
 
 | 이름 | 기본값 | 설명 |
 | --- | --- | --- |
-| `HUB_USER` | 없음 | 필수 로그인 아이디 |
-| `HUB_PASSWORD` | 없음 | 필수 로그인 비밀번호 |
 | `HUB_HOME` | 현재 사용자 홈 | 명령 실행 시 사용할 홈 |
 | `HUB_PROJECT_ROOT` | `~/Developer` | Git 프로젝트 저장 위치 |
 | `HUB_SHARED_ROOT` | `/Volumes/UnifyingStorage` | 파일 공유 루트 |
@@ -92,10 +97,14 @@ npm run hub
 | `HUB_NPM` | `npm` | 프런트엔드 실행에 사용할 npm 경로 |
 | `HUB_GIT` | `/usr/bin/git` | Git 실행 파일 경로 |
 | `HUB_COLIMA` | `/opt/homebrew/bin/colima` | Colima 실행 파일 경로 |
+| `HUB_DOCKER` | `/opt/homebrew/bin/docker` | Docker 실행 파일 경로 |
+| `HUB_LSOF` | `/usr/sbin/lsof` | TCP 리스너 확인 명령 경로 |
+| `HUB_CLOUDFLARE_CONFIG` | `~/.cloudflared/config.yml` | 공개 호스트명과 로컬 서비스 매핑 위치 |
 | `HUB_NO_FRONTEND` | `0` | `1`이면 API만 실행 |
 | `HUB_API_KEYS_FILE` | `~/.unifying-storage/api-keys.json` | API 키 해시와 폴더 연결 정보 저장 위치 |
+| `HUB_ADMIN_FILE` | `~/.unifying-storage/admin.json` | Administrator 비밀번호 해시와 세션 키 저장 위치 |
 
-로그인 정보가 없으면 모든 요청이 거부됩니다. 비밀번호를 저장소나 LaunchAgent 파일에 직접 커밋하지 말고, 운영 환경의 권한이 제한된 설정 파일이나 비밀 관리 기능을 사용하세요.
+관리자 설정 파일은 권한 `0600`으로 생성되며 비밀번호 원문을 저장하지 않습니다. 파일이 없거나 잘못되면 서버는 시작되지 않습니다.
 
 ## Cloudflare Tunnel로 공개하기
 
@@ -320,14 +329,14 @@ npm test
 
 이 앱은 파일 생성·삭제와 Git 명령을 수행합니다. 인터넷에 공개하기 전에 반드시 다음을 확인하세요.
 
-1. 길고 고유한 `HUB_PASSWORD`를 사용합니다.
+1. 길고 고유한 Administrator 비밀번호를 사용합니다.
 2. Cloudflare Tunnel 또는 신뢰할 수 있는 HTTPS 리버스 프록시 뒤에서 실행합니다.
 3. `HUB_SHARED_ROOT`와 `HUB_PROJECT_ROOT`에 필요한 데이터만 둡니다.
 4. 실행 사용자의 macOS 권한을 최소화합니다.
 5. 중요한 데이터는 별도 백업합니다. 웹의 삭제 기능은 휴지통이 아닌 영구 삭제입니다.
 6. Tunnel 인증서, JSON 자격증명, `.env` 파일을 Git에 올리지 않습니다.
 
-공용 계정 하나를 함께 쓰는 소규모 팀을 위한 도구입니다. 사용자별 권한, 감사 로그, 멀티테넌시가 필요하다면 별도의 인증·권한 계층을 추가해야 합니다.
+단일 `Administrator` 계정으로 운영하는 개인 서버용 도구입니다. 사용자별 권한, 감사 로그, 멀티테넌시가 필요하다면 별도의 인증·권한 계층을 추가해야 합니다.
 
 ## 라이선스
 
