@@ -23,23 +23,23 @@ type HubStatus = {
 
 type Project = { name: string; path: string; git: boolean; branch: string; changes: number; updatedAt: string };
 type FileEntry = { name: string; path: string; directory: boolean; size: number; updatedAt: string };
-type UploadProgress = {
-  title: string;
-  detail: string;
-  percent: number;
+type UploadItem = {
+  name: string;
   sent: number;
   total: number;
-  done: boolean;
-  speed?: number;
-  eta?: number;
+  speed: number;
+  status: "queued" | "uploading" | "done" | "error";
   error?: string;
 };
+type UploadProgress = { title: string; items: UploadItem[]; done: boolean; error?: string };
 type Preview = { entry: FileEntry; kind: "audio" | "text"; content: string; loading: boolean; error?: string };
 type FolderKey = { id: string; label: string; permission: "read" | "write"; createdAt: string };
 type KeyPanel = { entry: FileEntry; folderId: string | null; keys: FolderKey[]; revealed?: string };
 
 const textExtensions = /\.(txt|md|json|csv|log|js|jsx|ts|tsx|css|html|xml|yml|yaml|py|sh)$/i;
 const previewKind = (name: string) => name.toLowerCase().endsWith(".mp3") ? "audio" : textExtensions.test(name) ? "text" : null;
+const FILE_UPLOAD_CONCURRENCY = 3;
+const CHUNKS_PER_FILE = 3;
 
 const apiBase = () => typeof window !== "undefined" && window.location.port === "3000" ? "http://127.0.0.1:8787" : "";
 
@@ -96,7 +96,7 @@ export default function Home() {
   const [keyLabel, setKeyLabel] = useState("hackathon");
   const [keyPermission, setKeyPermission] = useState<"read" | "write">("read");
   const activeUploads = useRef(new Set<XMLHttpRequest>());
-  const activeUploadSession = useRef("");
+  const activeUploadSessions = useRef(new Set<string>());
   const uploadCancelled = useRef(false);
 
   const loadStatus = useCallback(async () => {
@@ -218,7 +218,7 @@ export default function Home() {
 
   const uploadOne = async (file: File, targetPath: string, onProgress: (loaded: number, speed: number) => void, archive = false) => {
     const session = await api<{ id: string; chunkSize: number; total: number }>("/api/upload-sessions", { method: "POST", body: JSON.stringify({ space, path: targetPath, name: file.name, size: file.size, archive }) });
-    activeUploadSession.current = session.id;
+    activeUploadSessions.current.add(session.id);
     const loaded = Array(session.total).fill(0) as number[];
     const started = performance.now();
     let next = 0;
@@ -249,52 +249,62 @@ export default function Home() {
       }
     };
     try {
-      await Promise.all(Array.from({ length: Math.min(4, session.total) }, worker));
+      await Promise.all(Array.from({ length: Math.min(CHUNKS_PER_FILE, session.total) }, worker));
       await api("/api/upload-complete", { method: "POST", body: JSON.stringify({ id: session.id }) });
     } catch (error) {
       await api(`/api/upload-sessions?id=${session.id}`, { method: "DELETE" }).catch(() => {});
       throw error;
     } finally {
-      activeUploadSession.current = "";
+      activeUploadSessions.current.delete(session.id);
     }
   };
 
   const cancelUpload = () => {
     uploadCancelled.current = true;
     for (const request of activeUploads.current) request.abort();
-    if (activeUploadSession.current) void api(`/api/upload-sessions?id=${activeUploadSession.current}`, { method: "DELETE" }).catch(() => {});
+    for (const id of activeUploadSessions.current) void api(`/api/upload-sessions?id=${id}`, { method: "DELETE" }).catch(() => {});
+    activeUploadSessions.current.clear();
   };
 
-  const updateUpload = (patch: Partial<UploadProgress>) => {
-    setUploadProgress((current) => current ? { ...current, ...patch } : current);
+  const updateUploadItem = (index: number, patch: Partial<UploadItem>) => {
+    setUploadProgress((current) => current ? { ...current, items: current.items.map((item, itemIndex) => itemIndex === index ? { ...item, ...patch } : item) } : current);
   };
 
   const uploadFiles = async (list: FileList) => {
     setUploadMenu(false);
     const selected = Array.from(list);
     if (!selected.length) return;
-    const total = selected.reduce((sum, file) => sum + file.size, 0);
-    let completed = 0;
     uploadCancelled.current = false;
-    setUploadProgress({ title: "파일 업로드", detail: "업로드 준비 중", percent: 0, sent: 0, total, done: false });
+    setUploadProgress({ title: "파일 업로드", items: selected.map((file) => ({ name: file.name, sent: 0, total: file.size, speed: 0, status: "queued" })), done: false });
     setBusy("upload");
+    const failures: string[] = [];
+    let next = 0;
     try {
-      for (let index = 0; index < selected.length; index++) {
-        if (uploadCancelled.current) throw new Error("업로드를 취소했습니다.");
-        const file = selected[index];
-        await uploadOne(file, path, (loaded, speed) => {
-          const sent = completed + loaded;
-          updateUpload({ detail: `${index + 1}/${selected.length} · ${file.name}`, sent, speed, eta: speed ? (total - sent) / speed : undefined, percent: total ? Math.round(sent / total * 100) : 100 });
-        });
-        completed += file.size;
-      }
-      setNotice(`${selected.length}개 파일 업로드 완료`);
-      updateUpload({ detail: `${selected.length}개 파일 업로드 완료`, sent: total, percent: 100, done: true });
+      const worker = async () => {
+        while (next < selected.length) {
+          const index = next++;
+          const file = selected[index];
+          if (uploadCancelled.current) return;
+          updateUploadItem(index, { status: "uploading" });
+          try {
+            await uploadOne(file, path, (sent, speed) => updateUploadItem(index, { sent, speed }));
+            updateUploadItem(index, { sent: file.size, speed: 0, status: "done" });
+          } catch (error) {
+            const message = error instanceof Error ? error.message : "업로드 실패";
+            failures.push(`${file.name}: ${message}`);
+            updateUploadItem(index, { speed: 0, status: "error", error: message });
+          }
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(FILE_UPLOAD_CONCURRENCY, selected.length) }, worker));
+      const message = uploadCancelled.current ? "업로드를 취소했습니다." : failures.length ? `${selected.length - failures.length}개 완료, ${failures.length}개 실패` : `${selected.length}개 파일 업로드 완료`;
+      setNotice(message);
+      setUploadProgress((current) => current ? { ...current, done: true, error: uploadCancelled.current || failures.length ? message : undefined } : current);
       await loadFiles();
     } catch (error) {
       const message = error instanceof Error ? error.message : "업로드 실패";
       setNotice(message);
-      updateUpload({ detail: "업로드 실패", done: true, error: message });
+      setUploadProgress((current) => current ? { ...current, done: true, error: message } : current);
     } finally {
       setBusy("");
     }
@@ -305,17 +315,19 @@ export default function Home() {
     const file = list[0];
     if (!file) return;
     uploadCancelled.current = false;
-    setUploadProgress({ title: "ZIP 폴더 업로드", detail: file.name, percent: 0, sent: 0, total: file.size, done: false });
+    setUploadProgress({ title: "ZIP 폴더 업로드", items: [{ name: file.name, sent: 0, total: file.size, speed: 0, status: "uploading" }], done: false });
     setBusy("archive-upload");
     try {
-      await uploadOne(file, path, (sent, speed) => updateUpload({ detail: file.name, sent, speed, eta: speed ? (file.size - sent) / speed : undefined, percent: file.size ? Math.round(sent / file.size * 100) : 100 }), true);
+      await uploadOne(file, path, (sent, speed) => updateUploadItem(0, { sent, speed }), true);
       setNotice("ZIP 폴더 업로드 완료");
-      updateUpload({ detail: "NAS에서 압축 해제 완료", sent: file.size, percent: 100, done: true });
+      updateUploadItem(0, { sent: file.size, speed: 0, status: "done" });
+      setUploadProgress((current) => current ? { ...current, done: true } : current);
       await loadFiles();
     } catch (error) {
       const message = error instanceof Error ? error.message : "ZIP 폴더 업로드 실패";
       setNotice(message);
-      updateUpload({ detail: message, done: true, error: message });
+      updateUploadItem(0, { speed: 0, status: "error", error: message });
+      setUploadProgress((current) => current ? { ...current, done: true, error: message } : current);
     } finally {
       setBusy("");
     }
@@ -458,6 +470,10 @@ export default function Home() {
   const storageDisk = status?.disks.shared;
   const storagePercent = storageDisk ? (storageDisk.used / storageDisk.total) * 100 : 0;
   const updated = status ? new Date(status.updatedAt).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "—";
+  const uploadSent = uploadProgress?.items.reduce((sum, item) => sum + item.sent, 0) || 0;
+  const uploadTotal = uploadProgress?.items.reduce((sum, item) => sum + item.total, 0) || 0;
+  const uploadSpeed = uploadProgress?.items.reduce((sum, item) => sum + item.speed, 0) || 0;
+  const uploadPercent = uploadTotal ? Math.round(uploadSent / uploadTotal * 100) : 0;
 
   return (
     <main className="app-shell">
@@ -548,9 +564,14 @@ export default function Home() {
       </section>
       {uploadProgress && <aside className={`upload-progress${uploadProgress.error ? " failed" : uploadProgress.done ? " complete" : ""}`} role="status" aria-live="polite">
         <div className="upload-progress-head"><div><span>{uploadProgress.done && !uploadProgress.error ? "완료" : uploadProgress.error ? "중단" : "업로드 중"}</span><strong>{uploadProgress.title}</strong></div>{uploadProgress.done ? <button onClick={() => setUploadProgress(null)} aria-label="업로드 상태 닫기"><X size={16} /></button> : <button className="cancel-upload" onClick={cancelUpload}>취소</button>}</div>
-        <div className="upload-progress-value"><strong>{uploadProgress.percent}%</strong><span>{uploadProgress.error || uploadProgress.detail}</span></div>
-        <div className="upload-progress-bar"><i style={{ width: `${uploadProgress.percent}%` }} /></div>
-        <div className="upload-progress-meta"><span>{fileSize(uploadProgress.sent)} / {fileSize(uploadProgress.total)}</span><span>{uploadProgress.done ? (uploadProgress.error ? "확인 필요" : "저장 완료") : uploadProgress.speed ? `${fileSize(uploadProgress.speed)}/s · 약 ${Math.max(1, Math.ceil((uploadProgress.eta || 0) / 60))}분 남음` : "속도 계산 중"}</span></div>
+        <div className="upload-progress-value"><strong>{uploadPercent}%</strong><span>{uploadProgress.items.filter((item) => item.status === "uploading").length}개 동시 전송</span></div>
+        <div className="upload-progress-bar"><i style={{ width: `${uploadPercent}%` }} /></div>
+        <div className="upload-progress-meta"><span>{fileSize(uploadSent)} / {fileSize(uploadTotal)}</span><span>{uploadProgress.done ? (uploadProgress.error ? "확인 필요" : "저장 완료") : uploadSpeed ? `${fileSize(uploadSpeed)}/s · 약 ${Math.max(1, Math.ceil((uploadTotal - uploadSent) / uploadSpeed / 60))}분 남음` : "속도 계산 중"}</span></div>
+        <div className="upload-items">{uploadProgress.items.map((item, index) => {
+          const percent = item.total ? Math.round(item.sent / item.total * 100) : 0;
+          const label = item.status === "queued" ? "대기" : item.status === "uploading" ? `${percent}%` : item.status === "done" ? "완료" : "실패";
+          return <div className={`upload-item ${item.status}`} key={`${item.name}:${index}`}><div className="upload-item-head"><strong title={item.name}>{item.name}</strong><span>{label}</span></div><div className="upload-item-bar"><i style={{ width: `${percent}%` }} /></div><small>{item.error || `${fileSize(item.sent)} / ${fileSize(item.total)}${item.speed ? ` · ${fileSize(item.speed)}/s` : ""}`}</small></div>;
+        })}</div>
       </aside>}
       {preview && <div className="preview-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setPreview(null); }}>
         <section className="preview-dialog" role="dialog" aria-modal="true" aria-labelledby="preview-title">

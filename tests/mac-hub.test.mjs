@@ -89,6 +89,7 @@ test("ZIP folder uploads are extracted server-side and can be cancelled", async 
   ]);
   assert.match(page, /ZIP 폴더 선택/);
   assert.match(page, /activeUploads\.current/);
+  assert.match(page, /activeUploadSessions\.current/);
   assert.match(server, /\/api\/upload-archive/);
   assert.match(server, /validateArchiveTree/);
   assert.match(server, /\/api\/upload-chunks/);
@@ -96,7 +97,11 @@ test("ZIP folder uploads are extracted server-side and can be cancelled", async 
   assert.match(server, /session\.json/);
   assert.match(server, /async function uploadSession/);
   assert.match(server, /path\.basename\(session\.name, path\.extname\(session\.name\)\)/);
-  assert.match(page, /Math\.min\(4, session\.total\)/);
+  assert.match(page, /CHUNKS_PER_FILE = 3/);
+  assert.match(page, /FILE_UPLOAD_CONCURRENCY = 3/);
+  assert.match(page, /Math\.min\(FILE_UPLOAD_CONCURRENCY, selected\.length\)/);
+  assert.match(page, /upload-item/);
+  assert.match(server, /const UPLOAD_CHUNK = 32 \* 1024 \* 1024/);
   assert.match(page, /\/s · 약/);
   assert.doesNotMatch(server, /MAX_UPLOAD|5GB 이하/);
 });
