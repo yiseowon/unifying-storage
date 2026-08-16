@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
-import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { createReadStream, createWriteStream, realpathSync } from "node:fs";
+import { createHash, createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
+import { createReadStream, createWriteStream, readFileSync, realpathSync } from "node:fs";
 import { access, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import http from "node:http";
 import os from "node:os";
@@ -16,8 +16,10 @@ const PROJECT_ROOT = process.env.HUB_PROJECT_ROOT || path.join(USER_HOME, "Devel
 const SHARED_ROOT = process.env.HUB_SHARED_ROOT || "/Volumes/UnifyingStorage";
 const GIT = process.env.HUB_GIT || "/usr/bin/git";
 const COLIMA = process.env.HUB_COLIMA || "/opt/homebrew/bin/colima";
+const DOCKER = process.env.HUB_DOCKER || "/opt/homebrew/bin/docker";
 const SCUTIL = process.env.HUB_SCUTIL || "/usr/sbin/scutil";
 const NC = process.env.HUB_NC || "/usr/bin/nc";
+const LSOF = process.env.HUB_LSOF || "/usr/sbin/lsof";
 const DITTO = process.env.HUB_DITTO || "/usr/bin/ditto";
 const MEMORY_PRESSURE = process.env.HUB_MEMORY_PRESSURE || "/usr/bin/memory_pressure";
 const NPM = process.env.HUB_NPM || "npm";
@@ -25,10 +27,13 @@ const MAX_JSON = 1024 * 1024;
 const MAX_TEXT_PREVIEW = 10 * 1024 * 1024;
 const TEXT_EXTENSIONS = new Set([".txt", ".md", ".json", ".csv", ".log", ".js", ".jsx", ".ts", ".tsx", ".css", ".html", ".xml", ".yml", ".yaml", ".py", ".sh"]);
 const SESSION_SECONDS = 12 * 60 * 60;
-const UPLOAD_CHUNK = 16 * 1024 * 1024;
+const UPLOAD_CHUNK = 32 * 1024 * 1024;
 const UPLOAD_SESSIONS = path.join(os.tmpdir(), "mac-hub-upload-sessions");
 const API_KEYS_FILE = process.env.HUB_API_KEYS_FILE || path.join(USER_HOME, ".unifying-storage", "api-keys.json");
+const ADMIN_FILE = process.env.HUB_ADMIN_FILE || path.join(USER_HOME, ".unifying-storage", "admin.json");
+const CLOUDFLARE_CONFIG = process.env.HUB_CLOUDFLARE_CONFIG || path.join(USER_HOME, ".cloudflared", "config.yml");
 const uploadSessions = new Map();
+let administrator;
 
 async function keyStore(file = API_KEYS_FILE) {
   try { return JSON.parse(await readFile(file, "utf8")); }
@@ -91,27 +96,35 @@ const sameText = (left, right) => {
   return a.length === b.length && timingSafeEqual(a, b);
 };
 
-export function authorized(authorization, user = process.env.HUB_USER, password = process.env.HUB_PASSWORD) {
-  if (!user || !password || !authorization?.startsWith("Basic ")) return false;
-  let credentials;
-  try { credentials = Buffer.from(authorization.slice(6), "base64").toString("utf8"); }
-  catch { return false; }
-  const separator = credentials.indexOf(":");
-  return separator > 0 && sameText(credentials.slice(0, separator), user) && sameText(credentials.slice(separator + 1), password);
+export function passwordHash(password, salt = randomBytes(16).toString("hex")) {
+  return { salt, hash: scryptSync(password, salt, 64).toString("hex") };
 }
 
-const signSession = (user, expires, password) => createHmac("sha256", password).update(`${user}:${expires}`).digest("hex");
+export function validPassword(password, credentials) {
+  if (!password || !credentials?.salt || !credentials?.hash) return false;
+  return sameText(scryptSync(password, credentials.salt, 64).toString("hex"), credentials.hash);
+}
 
-export function sessionToken(user, password, now = Date.now()) {
+export function loadAdministrator(file = ADMIN_FILE) {
+  const config = JSON.parse(readFileSync(file, "utf8"));
+  if (config.username !== "Administrator" || !config.password?.salt || !config.password?.hash || !config.sessionSecret) {
+    throw new Error(`관리자 설정이 올바르지 않습니다: ${file}`);
+  }
+  return config;
+}
+
+const signSession = (expires, secret) => createHmac("sha256", secret).update(String(expires)).digest("hex");
+
+export function sessionToken(secret, now = Date.now()) {
   const expires = Math.floor(now / 1000) + SESSION_SECONDS;
-  return `${expires}.${signSession(user, expires, password)}`;
+  return `${expires}.${signSession(expires, secret)}`;
 }
 
-export function validSession(token, user = process.env.HUB_USER, password = process.env.HUB_PASSWORD, now = Date.now()) {
-  if (!token || !user || !password) return false;
+export function validSession(token, secret, now = Date.now()) {
+  if (!token || !secret) return false;
   const [expiresText, signature] = token.split(".");
   const expires = Number(expiresText);
-  return Number.isSafeInteger(expires) && expires > now / 1000 && sameText(signature || "", signSession(user, expires, password));
+  return Number.isSafeInteger(expires) && expires > now / 1000 && sameText(signature || "", signSession(expires, secret));
 }
 
 function cookie(request, name) {
@@ -119,7 +132,7 @@ function cookie(request, name) {
 }
 
 function loggedIn(request) {
-  return validSession(cookie(request, "hub_session"));
+  return validSession(cookie(request, "hub_session"), administrator?.sessionSecret);
 }
 
 function loginPage(response, invalid = false) {
@@ -132,7 +145,7 @@ function loginPage(response, invalid = false) {
   });
   response.end(`<!doctype html><html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Unifying Storage 로그인</title><style>
     :root{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#17181a;background:#f1f4f8}*{box-sizing:border-box}body{min-height:100vh;margin:0;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at 50% 0,#e4f0ff 0,transparent 38%),#f4f6f9}.card{width:min(420px,100%);padding:38px;border:1px solid rgba(0,0,0,.08);border-radius:22px;background:rgba(255,255,255,.94);box-shadow:0 24px 70px rgba(28,45,72,.14);backdrop-filter:blur(18px)}.icon{width:52px;height:52px;display:grid;place-items:center;margin-bottom:24px;border-radius:15px;color:#fff;background:linear-gradient(145deg,#1684ff,#0065d8);box-shadow:0 10px 24px rgba(0,113,227,.28)}h1{margin:0;font-size:28px;letter-spacing:-.04em}p{margin:9px 0 28px;color:#68717d;font-size:14px;line-height:1.55}label{display:block;margin:15px 0 7px;color:#424851;font-size:13px;font-weight:650}input{width:100%;height:46px;padding:0 14px;border:1px solid #d8dde5;border-radius:11px;background:#fff;font-size:15px;outline:none}input:focus{border-color:#0071e3;box-shadow:0 0 0 4px rgba(0,113,227,.11)}button{width:100%;height:48px;margin-top:24px;border:0;border-radius:11px;color:#fff;background:#0071e3;font-size:15px;font-weight:700;cursor:pointer}button:hover{background:#0067d1}.error{margin:-8px 0 18px;padding:11px 13px;border-radius:9px;color:#a3211b;background:#ffebe9;font-size:13px}.foot{margin:19px 0 0;text-align:center;font-size:12px;color:#8b929c}@media(max-width:480px){.card{padding:30px 24px;border-radius:18px}}
-  </style></head><body><main class="card"><div class="icon" aria-hidden="true"><svg width="27" height="27" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M10 16h.01M2.2 11.6A2 2 0 0 0 2 12.5V18a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-5.5a2 2 0 0 0-.2-.9L18.6 5.1A2 2 0 0 0 16.8 4H7.2a2 2 0 0 0-1.8 1.1zM22 12H2M6 16h.01"/></svg></div><h1>Unifying Storage</h1><p>팀 워크스페이스에 접속하려면 로그인하세요.</p>${invalid ? '<div class="error" role="alert">아이디 또는 비밀번호가 올바르지 않습니다.</div>' : ""}<form method="post" action="/login"><label for="user">아이디</label><input id="user" name="user" autocomplete="username" required autofocus><label for="password">비밀번호</label><input id="password" name="password" type="password" autocomplete="current-password" required><button>로그인</button></form><p class="foot">Private storage · HTTPS secured</p></main></body></html>`);
+  </style></head><body><main class="card"><div class="icon" aria-hidden="true"><svg width="27" height="27" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M10 16h.01M2.2 11.6A2 2 0 0 0 2 12.5V18a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-5.5a2 2 0 0 0-.2-.9L18.6 5.1A2 2 0 0 0 16.8 4H7.2a2 2 0 0 0-1.8 1.1zM22 12H2M6 16h.01"/></svg></div><h1>Unifying Storage</h1><p>관리자 워크스페이스에 접속하려면 로그인하세요.</p>${invalid ? '<div class="error" role="alert">비밀번호가 올바르지 않습니다.</div>' : ""}<form method="post" action="/login"><label for="user">아이디</label><input id="user" name="user" value="Administrator" autocomplete="username" readonly><label for="password">비밀번호</label><input id="password" name="password" type="password" autocomplete="current-password" required autofocus><button>로그인</button></form><p class="foot">Private storage · HTTPS secured</p></main></body></html>`);
 }
 
 async function login(request, response) {
@@ -144,12 +157,10 @@ async function login(request, response) {
     chunks.push(chunk);
   }
   const form = new URLSearchParams(Buffer.concat(chunks).toString("utf8"));
-  const user = process.env.HUB_USER || "";
-  const password = process.env.HUB_PASSWORD || "";
-  if (!sameText(form.get("user") || "", user) || !sameText(form.get("password") || "", password)) return loginPage(response, true);
+  if (!sameText(form.get("user") || "", administrator.username) || !validPassword(form.get("password") || "", administrator.password)) return loginPage(response, true);
   response.writeHead(303, {
     Location: "/",
-    "Set-Cookie": `hub_session=${sessionToken(user, password)}; Path=/; Max-Age=${SESSION_SECONDS}; HttpOnly; Secure; SameSite=Strict`,
+    "Set-Cookie": `hub_session=${sessionToken(administrator.sessionSecret)}; Path=/; Max-Age=${SESSION_SECONDS}; HttpOnly; Secure; SameSite=Strict`,
     "Cache-Control": "no-store",
   });
   response.end();
@@ -310,13 +321,50 @@ async function validateArchiveTree(target) {
   if (info.isDirectory()) for (const entry of await readdir(target)) await validateArchiveTree(path.join(target, entry));
 }
 
+export function cloudflareRoutes(config = "") {
+  const routes = [];
+  let hostname = "";
+  for (const line of config.split("\n")) {
+    const host = line.match(/^\s*-?\s*hostname:\s*["']?([^"'#\s]+)["']?/);
+    if (host) hostname = host[1];
+    const service = line.match(/^\s*(?:-\s*)?service:\s*["']?([^"'#\s]+)["']?/);
+    if (hostname && service) { routes.push({ hostname, service: service[1] }); hostname = ""; }
+  }
+  return routes;
+}
+
+export function dockerContainers(output = "") {
+  return output.split("\n").filter(Boolean).flatMap((line) => {
+    try {
+      const item = JSON.parse(line);
+      return [{ name: item.Names, image: item.Image, ports: item.Ports || "", status: item.Status }];
+    } catch { return []; }
+  });
+}
+
+export function tcpListeners(output = "") {
+  const seen = new Set();
+  return output.split("\n").slice(1).flatMap((line) => {
+    const parts = line.trim().split(/\s+/);
+    const address = parts.at(-1) === "(LISTEN)" ? parts.at(-2) : parts.at(-1);
+    const port = address?.match(/:(\d+)$/)?.[1];
+    const key = `${parts[0]}:${port}`;
+    if (!port || seen.has(key)) return [];
+    seen.add(key);
+    return [{ process: parts[0], port: Number(port), address }];
+  });
+}
+
 async function status() {
   const interfaces = os.networkInterfaces();
   const tailAddress = Object.values(interfaces).flat().find((item) => item?.family === "IPv4" && item.address.startsWith("100."))?.address || "";
-  const [tailscale, ssh, colima, memoryPressure, systemDisk, sharedDisk] = await Promise.all([
+  const [tailscale, ssh, colima, containers, listeners, tunnelConfig, memoryPressure, systemDisk, sharedDisk] = await Promise.all([
     command(SCUTIL, ["--nc", "list"]),
     command(NC, ["-z", "-w", "2", "127.0.0.1", "22"]),
     command(COLIMA, ["status"]),
+    command(DOCKER, ["ps", "--format", "{{json .}}"]),
+    command(LSOF, ["-nP", "-iTCP", "-sTCP:LISTEN"]),
+    readFile(CLOUDFLARE_CONFIG, "utf8").catch(() => ""),
     command(MEMORY_PRESSURE, ["-Q"]),
     disk("/System/Volumes/Data"),
     disk(SHARED_ROOT),
@@ -333,6 +381,11 @@ async function status() {
     tailscale: { connected: tailscale.stdout.includes("(Connected)"), ip: tailAddress },
     ssh: ssh.ok,
     docker: { running: colima.ok && /colima is running/i.test(`${colima.stdout} ${colima.stderr}`), detail: colima.ok ? colima.stdout : "정지" },
+    hosting: {
+      routes: cloudflareRoutes(tunnelConfig),
+      containers: containers.ok ? dockerContainers(containers.stdout) : [],
+      listeners: listeners.ok ? tcpListeners(listeners.stdout) : [],
+    },
     disks: { system: systemDisk, shared: sharedDisk },
     sharedReady: Boolean(sharedDisk),
     updatedAt: new Date().toISOString(),
@@ -722,6 +775,7 @@ function tailscaleAddress() {
 }
 
 export function startHub() {
+  administrator = loadAdministrator();
   const host = tailscaleAddress();
   if (!host) throw new Error("Tailscale IPv4 주소가 없어 Mac Hub를 안전하게 시작할 수 없습니다.");
   const port = Number(process.env.HUB_PORT || 8787);
@@ -758,4 +812,18 @@ export function startHub() {
   return server;
 }
 
-if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) startHub();
+async function setupAdministrator() {
+  const chunks = [];
+  for await (const chunk of process.stdin) chunks.push(chunk);
+  const password = Buffer.concat(chunks).toString("utf8").trimEnd();
+  if (password.length < 8) throw new Error("비밀번호는 8자 이상이어야 합니다.");
+  const config = { username: "Administrator", password: passwordHash(password), sessionSecret: randomBytes(32).toString("hex") };
+  await mkdir(path.dirname(ADMIN_FILE), { recursive: true, mode: 0o700 });
+  await writeFile(ADMIN_FILE, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+  console.log(`Administrator 설정 완료: ${ADMIN_FILE}`);
+}
+
+if (process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  if (process.argv[2] === "--setup-admin") await setupAdministrator();
+  else startHub();
+}
