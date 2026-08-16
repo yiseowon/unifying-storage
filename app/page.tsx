@@ -38,7 +38,7 @@ type KeyPanel = { entry: FileEntry; folderId: string | null; keys: FolderKey[]; 
 
 const textExtensions = /\.(txt|md|json|csv|log|js|jsx|ts|tsx|css|html|xml|yml|yaml|py|sh)$/i;
 const previewKind = (name: string) => name.toLowerCase().endsWith(".mp3") ? "audio" : textExtensions.test(name) ? "text" : null;
-const FILE_UPLOAD_CONCURRENCY = 3;
+const FILE_UPLOAD_CONCURRENCY = 10;
 const CHUNKS_PER_FILE = 3;
 
 const apiBase = () => typeof window !== "undefined" && window.location.port === "3000" ? "http://127.0.0.1:8787" : "";

@@ -98,7 +98,7 @@ test("ZIP folder uploads are extracted server-side and can be cancelled", async 
   assert.match(server, /async function uploadSession/);
   assert.match(server, /path\.basename\(session\.name, path\.extname\(session\.name\)\)/);
   assert.match(page, /CHUNKS_PER_FILE = 3/);
-  assert.match(page, /FILE_UPLOAD_CONCURRENCY = 3/);
+  assert.match(page, /FILE_UPLOAD_CONCURRENCY = 10/);
   assert.match(page, /Math\.min\(FILE_UPLOAD_CONCURRENCY, selected\.length\)/);
   assert.match(page, /upload-item/);
   assert.match(server, /const UPLOAD_CHUNK = 32 \* 1024 \* 1024/);
